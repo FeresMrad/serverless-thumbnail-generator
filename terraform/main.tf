@@ -8,6 +8,14 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.1"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.0"
+    }
   }
 }
 
@@ -89,6 +97,46 @@ resource "aws_sqs_queue_policy" "thumbnail_queue_policy" {
   })
 }
 
+# Build Lambda deployment package with dependencies
+resource "null_resource" "lambda_build" {
+  triggers = {
+    # Rebuild when function code or requirements change
+    lambda_code  = filemd5("../lambda-function/lambda_function.py")
+    requirements = filemd5("../lambda-function/requirements.txt")
+  }
+
+  provisioner "local-exec" {
+    command = <<EOF
+cd ../lambda-function
+echo "Building Lambda deployment package..."
+
+# Create clean deployment directory
+rm -rf deployment
+mkdir deployment
+
+# Copy Lambda function
+cp lambda_function.py deployment/
+
+# Install dependencies using Docker for Linux compatibility
+docker run --rm -v "$PWD":/var/task \
+  public.ecr.aws/lambda/python:3.13 \
+  /bin/bash -c "cd /var/task && pip install -r requirements.txt -t deployment/" 2>/dev/null || \
+  python -m pip install -r requirements.txt -t deployment/ --upgrade
+
+echo "Lambda package built successfully"
+EOF
+  }
+}
+
+# Create ZIP file of the complete Lambda package
+data "archive_file" "lambda_package" {
+  type        = "zip"
+  source_dir  = "../lambda-function/deployment"
+  output_path = "../lambda-function/lambda-deployment.zip"
+  
+  depends_on = [null_resource.lambda_build]
+}
+
 # IAM role for Lambda
 resource "aws_iam_role" "lambda_role" {
   name = "${var.project_name}-lambda-role"
@@ -165,7 +213,7 @@ resource "aws_iam_role_policy" "lambda_sqs_policy" {
 
 # Lambda function
 resource "aws_lambda_function" "thumbnail_generator" {
-  filename      = "../lambda-function/lambda-function.zip"
+  filename      = data.archive_file.lambda_package.output_path
   function_name = "${var.project_name}-thumbnail-generator"
   role          = aws_iam_role.lambda_role.arn
   handler       = "lambda_function.lambda_handler"
@@ -173,8 +221,8 @@ resource "aws_lambda_function" "thumbnail_generator" {
   timeout       = 30
   memory_size   = 512
 
-  #Detect code changes
-  source_code_hash = filebase64sha256("../lambda-function/lambda-function.zip")
+  # Detect code changes automatically
+  source_code_hash = data.archive_file.lambda_package.output_base64sha256
 
   environment {
     variables = {
@@ -185,6 +233,7 @@ resource "aws_lambda_function" "thumbnail_generator" {
   depends_on = [
     aws_iam_role_policy.lambda_s3_policy,
     aws_iam_role_policy.lambda_sqs_policy,
+    data.archive_file.lambda_package,
   ]
 }
 
@@ -196,7 +245,7 @@ resource "aws_lambda_event_source_mapping" "sqs_trigger" {
   enabled          = true
 }
 
-# S3 bucket notification to send to SQS instead of Lambda directly
+# S3 bucket notification to send to SQS
 resource "aws_s3_bucket_notification" "thumbnail_trigger" {
   bucket = aws_s3_bucket.thumbnail_bucket.id
 
@@ -228,4 +277,12 @@ output "sqs_queue_url" {
 output "sqs_dlq_url" {
   description = "URL of the Dead Letter Queue"
   value       = aws_sqs_queue.thumbnail_dlq.url
+}
+
+output "deployment_info" {
+  description = "Information about the deployment"
+  value = {
+    lambda_package_size = data.archive_file.lambda_package.output_size
+    source_code_hash    = data.archive_file.lambda_package.output_base64sha256
+  }
 }
