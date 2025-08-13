@@ -4,7 +4,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    
     random = {
       source  = "hashicorp/random"
       version = "~> 3.1"
@@ -45,6 +44,49 @@ resource "aws_s3_bucket_versioning" "thumbnail_bucket" {
   versioning_configuration {
     status = "Enabled"
   }
+}
+
+# SQS queue for S3 notifications
+resource "aws_sqs_queue" "thumbnail_queue" {
+  name                      = "${var.project_name}-thumbnail-queue"
+  message_retention_seconds = 1209600 # 14 days
+  visibility_timeout_seconds = 300    # 5 minutes (should be >= Lambda timeout)
+  
+  # Configure redrive policy for DLQ
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.thumbnail_dlq.arn
+    maxReceiveCount     = 3
+  })
+}
+
+# Dead Letter Queue for failed messages
+resource "aws_sqs_queue" "thumbnail_dlq" {
+  name                      = "${var.project_name}-thumbnail-dlq"
+  message_retention_seconds = 1209600 # 14 days
+}
+
+# SQS queue policy to allow S3 to send messages
+resource "aws_sqs_queue_policy" "thumbnail_queue_policy" {
+  queue_url = aws_sqs_queue.thumbnail_queue.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "s3.amazonaws.com"
+        }
+        Action = "sqs:SendMessage"
+        Resource = aws_sqs_queue.thumbnail_queue.arn
+        Condition = {
+          ArnEquals = {
+            "aws:SourceArn" = aws_s3_bucket.thumbnail_bucket.arn
+          }
+        }
+      }
+    ]
+  })
 }
 
 # IAM role for Lambda
@@ -97,15 +139,42 @@ resource "aws_iam_role_policy" "lambda_s3_policy" {
   })
 }
 
+# IAM policy for Lambda to access SQS
+resource "aws_iam_role_policy" "lambda_sqs_policy" {
+  name = "${var.project_name}-lambda-sqs-policy"
+  role = aws_iam_role.lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes"
+        ]
+        Resource = [
+          aws_sqs_queue.thumbnail_queue.arn,
+          aws_sqs_queue.thumbnail_dlq.arn
+        ]
+      }
+    ]
+  })
+}
+
 # Lambda function
 resource "aws_lambda_function" "thumbnail_generator" {
-  filename         = "../lambda-function/lambda-function.zip"
-  function_name    = "${var.project_name}-thumbnail-generator"
-  role            = aws_iam_role.lambda_role.arn
-  handler         = "lambda_function.lambda_handler"
-  runtime         = "python3.13"
-  timeout         = 30
-  memory_size     = 512
+  filename      = "../lambda-function/lambda-function.zip"
+  function_name = "${var.project_name}-thumbnail-generator"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "lambda_function.lambda_handler"
+  runtime       = "python3.13"
+  timeout       = 30
+  memory_size   = 512
+
+  #Detect code changes
+  source_code_hash = filebase64sha256("../lambda-function/lambda-function.zip")
 
   environment {
     variables = {
@@ -115,40 +184,48 @@ resource "aws_lambda_function" "thumbnail_generator" {
 
   depends_on = [
     aws_iam_role_policy.lambda_s3_policy,
+    aws_iam_role_policy.lambda_sqs_policy,
   ]
 }
 
-# Lambda permission for S3 to invoke the function
-resource "aws_lambda_permission" "s3_invoke" {
-  statement_id  = "AllowExecutionFromS3Bucket"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.thumbnail_generator.function_name
-  principal     = "s3.amazonaws.com"
-  source_arn    = aws_s3_bucket.thumbnail_bucket.arn
+# Lambda event source mapping for SQS
+resource "aws_lambda_event_source_mapping" "sqs_trigger" {
+  event_source_arn = aws_sqs_queue.thumbnail_queue.arn
+  function_name    = aws_lambda_function.thumbnail_generator.arn
+  batch_size       = 1
+  enabled          = true
 }
 
-# S3 bucket notification to trigger Lambda
+# S3 bucket notification to send to SQS instead of Lambda directly
 resource "aws_s3_bucket_notification" "thumbnail_trigger" {
   bucket = aws_s3_bucket.thumbnail_bucket.id
 
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.thumbnail_generator.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "images/"
-    filter_suffix       = ""
+  queue {
+    queue_arn     = aws_sqs_queue.thumbnail_queue.arn
+    events        = ["s3:ObjectCreated:*"]
+    filter_prefix = "images/"
   }
 
-  depends_on = [aws_lambda_permission.s3_invoke]
+  depends_on = [aws_sqs_queue_policy.thumbnail_queue_policy]
 }
 
-# Output Lambda function name
+# Outputs
+output "bucket_name" {
+  description = "Name of the S3 bucket"
+  value       = aws_s3_bucket.thumbnail_bucket.bucket
+}
+
 output "lambda_function_name" {
   description = "Name of the Lambda function"
   value       = aws_lambda_function.thumbnail_generator.function_name
 }
 
-# Output bucket name for use in Lambda
-output "bucket_name" {
-  description = "Name of the S3 bucket"
-  value       = aws_s3_bucket.thumbnail_bucket.bucket
+output "sqs_queue_url" {
+  description = "URL of the SQS queue"
+  value       = aws_sqs_queue.thumbnail_queue.url
+}
+
+output "sqs_dlq_url" {
+  description = "URL of the Dead Letter Queue"
+  value       = aws_sqs_queue.thumbnail_dlq.url
 }
