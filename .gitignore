@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 .env
 venv/
+requirements-dev.txt
 
 # Terraform
 *.tfstate
@@ -22,6 +23,7 @@ venv/
 # Lambda deployment artifacts
 lambda-function/deployment/
 lambda-function/*.zip
+lambda-function/test_local.py
 
 # Lambda testing artifacts
 response.json
