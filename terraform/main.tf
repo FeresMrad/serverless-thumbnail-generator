@@ -23,6 +23,11 @@ provider "aws" {
   region = var.aws_region
 }
 
+# ===========================
+# VARIABLES
+# ===========================
+
+# Core Configuration
 variable "aws_region" {
   description = "AWS region"
   type        = string
@@ -34,6 +39,99 @@ variable "project_name" {
   type        = string
   default     = "thumbnail-generator"
 }
+
+# Lambda Configuration
+variable "lambda_timeout" {
+  description = "Lambda function timeout in seconds"
+  type        = number
+  default     = 60
+}
+
+variable "lambda_memory_size" {
+  description = "Lambda function memory in MB"
+  type        = number
+  default     = 512
+}
+
+variable "lambda_runtime" {
+  description = "Lambda runtime version"
+  type        = string
+  default     = "python3.13"
+}
+
+# SQS Configuration
+variable "sqs_visibility_timeout" {
+  description = "SQS visibility timeout in seconds (should be >= Lambda timeout)"
+  type        = number
+  default     = 300
+}
+
+variable "sqs_message_retention_days" {
+  description = "SQS message retention in days"
+  type        = number
+  default     = 14
+}
+
+variable "sqs_max_receive_count" {
+  description = "Max receive count before sending to DLQ"
+  type        = number
+  default     = 3
+}
+
+# Monitoring Configuration
+variable "log_retention_days" {
+  description = "CloudWatch log retention in days"
+  type        = number
+  default     = 14
+}
+
+variable "error_rate_threshold" {
+  description = "Number of errors to trigger alarm"
+  type        = number
+  default     = 5
+}
+
+variable "lambda_duration_threshold_ms" {
+  description = "Lambda duration threshold for alarm in milliseconds"
+  type        = number
+  default     = 30000
+}
+
+# Image Processing Configuration
+variable "thumbnail_max_size" {
+  description = "Maximum thumbnail dimensions (width, height)"
+  type        = object({
+    width  = number
+    height = number
+  })
+  default = {
+    width  = 200
+    height = 200
+  }
+}
+
+variable "thumbnail_quality" {
+  description = "JPEG quality for thumbnails (1-100)"
+  type        = number
+  default     = 85
+}
+
+# Feature Flags
+variable "enable_xray_tracing" {
+  description = "Enable X-Ray tracing for Lambda"
+  type        = bool
+  default     = true
+}
+
+variable "enable_versioning" {
+  description = "Enable S3 bucket versioning"
+  type        = bool
+  default     = true
+}
+
+# ===========================
+# RESOURCES
+# ===========================
 
 # S3 bucket for images and thumbnails
 resource "aws_s3_bucket" "thumbnail_bucket" {
@@ -50,27 +148,27 @@ resource "random_string" "bucket_suffix" {
 resource "aws_s3_bucket_versioning" "thumbnail_bucket" {
   bucket = aws_s3_bucket.thumbnail_bucket.id
   versioning_configuration {
-    status = "Enabled"
+    status = var.enable_versioning ? "Enabled" : "Disabled"
   }
 }
 
 # SQS queue for S3 notifications
 resource "aws_sqs_queue" "thumbnail_queue" {
-  name                      = "${var.project_name}-thumbnail-queue"
-  message_retention_seconds = 1209600 # 14 days
-  visibility_timeout_seconds = 300    # 5 minutes (should be >= Lambda timeout)
+  name                       = "${var.project_name}-thumbnail-queue"
+  message_retention_seconds  = var.sqs_message_retention_days * 86400
+  visibility_timeout_seconds = var.sqs_visibility_timeout
   
   # Configure redrive policy for DLQ
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.thumbnail_dlq.arn
-    maxReceiveCount     = 3
+    maxReceiveCount     = var.sqs_max_receive_count
   })
 }
 
 # Dead Letter Queue for failed messages
 resource "aws_sqs_queue" "thumbnail_dlq" {
   name                      = "${var.project_name}-thumbnail-dlq"
-  message_retention_seconds = 1209600 # 14 days
+  message_retention_seconds = var.sqs_message_retention_days * 86400
 }
 
 # SQS queue policy to allow S3 to send messages
@@ -210,6 +308,7 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
 
 # IAM policy for X-Ray tracing
 resource "aws_iam_role_policy_attachment" "lambda_xray" {
+  count      = var.enable_xray_tracing ? 1 : 0
   policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
   role       = aws_iam_role.lambda_role.name
 }
@@ -244,21 +343,27 @@ resource "aws_lambda_function" "thumbnail_generator" {
   function_name = "${var.project_name}-thumbnail-generator"
   role          = aws_iam_role.lambda_role.arn
   handler       = "lambda_function.lambda_handler"
-  runtime       = "python3.13"
-  timeout       = 60  # Increased for better tracing
-  memory_size   = 512
+  runtime       = var.lambda_runtime
+  timeout       = var.lambda_timeout
+  memory_size   = var.lambda_memory_size
 
   # Detect code changes automatically
   source_code_hash = data.archive_file.lambda_package.output_base64sha256
 
-  # Enable X-Ray tracing
-  tracing_config {
-    mode = "Active"
+  # Enable X-Ray tracing conditionally
+  dynamic "tracing_config" {
+    for_each = var.enable_xray_tracing ? [1] : []
+    content {
+      mode = "Active"
+    }
   }
 
   environment {
     variables = {
-      S3_BUCKET = aws_s3_bucket.thumbnail_bucket.bucket
+      S3_BUCKET            = aws_s3_bucket.thumbnail_bucket.bucket
+      THUMBNAIL_MAX_WIDTH  = var.thumbnail_max_size.width
+      THUMBNAIL_MAX_HEIGHT = var.thumbnail_max_size.height
+      THUMBNAIL_QUALITY    = var.thumbnail_quality
     }
   }
 
@@ -267,7 +372,6 @@ resource "aws_lambda_function" "thumbnail_generator" {
     aws_iam_role_policy.lambda_sqs_policy,
     aws_iam_role_policy.lambda_cloudwatch_metrics,
     aws_iam_role_policy_attachment.lambda_basic,
-    aws_iam_role_policy_attachment.lambda_xray,
     data.archive_file.lambda_package,
   ]
 }
@@ -276,7 +380,7 @@ resource "aws_lambda_function" "thumbnail_generator" {
 resource "aws_lambda_event_source_mapping" "sqs_trigger" {
   event_source_arn = aws_sqs_queue.thumbnail_queue.arn
   function_name    = aws_lambda_function.thumbnail_generator.arn
-  batch_size       = 1
+  batch_size       = 1  # Keep this hardcoded - architectural decision for image processing
   enabled          = true
 }
 
@@ -287,7 +391,7 @@ resource "aws_s3_bucket_notification" "thumbnail_trigger" {
   queue {
     queue_arn     = aws_sqs_queue.thumbnail_queue.arn
     events        = ["s3:ObjectCreated:*"]
-    filter_prefix = "images/"
+    filter_prefix = "images/"  # Keep hardcoded - core design decision
   }
 
   depends_on = [aws_sqs_queue_policy.thumbnail_queue_policy]
@@ -431,7 +535,7 @@ resource "aws_cloudwatch_dashboard" "thumbnail_dashboard" {
 # CloudWatch Log Group with retention
 resource "aws_cloudwatch_log_group" "lambda_logs" {
   name              = "/aws/lambda/${aws_lambda_function.thumbnail_generator.function_name}"
-  retention_in_days = 14
+  retention_in_days = var.log_retention_days
 }
 
 # CloudWatch Alarms
@@ -443,7 +547,7 @@ resource "aws_cloudwatch_metric_alarm" "high_error_rate" {
   namespace           = "ThumbnailGenerator"
   period              = "300"
   statistic           = "Sum"
-  threshold           = "5"
+  threshold           = var.error_rate_threshold
   alarm_description   = "This metric monitors thumbnail generation error rate"
   
   dimensions = {
@@ -459,7 +563,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   namespace           = "AWS/Lambda"
   period              = "300"
   statistic           = "Average"
-  threshold           = "30000"  # 30 seconds
+  threshold           = var.lambda_duration_threshold_ms
   alarm_description   = "This metric monitors lambda function duration"
   
   dimensions = {
@@ -475,7 +579,7 @@ resource "aws_cloudwatch_metric_alarm" "sqs_dlq_messages" {
   namespace           = "AWS/SQS"
   period              = "300"
   statistic           = "Average"
-  threshold           = "0"
+  threshold           = "0"  # Keep hardcoded - you always want to know about DLQ messages
   alarm_description   = "This metric monitors messages in the dead letter queue"
   
   dimensions = {
@@ -483,7 +587,10 @@ resource "aws_cloudwatch_metric_alarm" "sqs_dlq_messages" {
   }
 }
 
-# Outputs
+# ===========================
+# OUTPUTS
+# ===========================
+
 output "bucket_name" {
   description = "Name of the S3 bucket"
   value       = aws_s3_bucket.thumbnail_bucket.bucket
@@ -511,7 +618,7 @@ output "cloudwatch_dashboard_url" {
 
 output "xray_traces_url" {
   description = "URL to X-Ray traces"
-  value       = "https://${var.aws_region}.console.aws.amazon.com/xray/home?region=${var.aws_region}#/traces"
+  value       = var.enable_xray_tracing ? "https://${var.aws_region}.console.aws.amazon.com/xray/home?region=${var.aws_region}#/traces" : "X-Ray tracing is disabled"
 }
 
 output "deployment_info" {
@@ -519,7 +626,7 @@ output "deployment_info" {
   value = {
     lambda_package_size = data.archive_file.lambda_package.output_size
     source_code_hash    = data.archive_file.lambda_package.output_base64sha256
-    xray_tracing        = "enabled"
+    xray_tracing        = var.enable_xray_tracing ? "enabled" : "disabled"
     custom_metrics      = "enabled"
     dashboard_created   = aws_cloudwatch_dashboard.thumbnail_dashboard.dashboard_name
   }
