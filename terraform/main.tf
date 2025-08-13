@@ -4,6 +4,11 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.1"
+    }
   }
 }
 
@@ -111,6 +116,29 @@ resource "aws_lambda_function" "thumbnail_generator" {
   depends_on = [
     aws_iam_role_policy.lambda_s3_policy,
   ]
+}
+
+# Lambda permission for S3 to invoke the function
+resource "aws_lambda_permission" "s3_invoke" {
+  statement_id  = "AllowExecutionFromS3Bucket"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.thumbnail_generator.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.thumbnail_bucket.arn
+}
+
+# S3 bucket notification to trigger Lambda
+resource "aws_s3_bucket_notification" "thumbnail_trigger" {
+  bucket = aws_s3_bucket.thumbnail_bucket.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.thumbnail_generator.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "images/"
+    filter_suffix       = ""
+  }
+
+  depends_on = [aws_lambda_permission.s3_invoke]
 }
 
 # Output Lambda function name
