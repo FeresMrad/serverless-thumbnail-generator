@@ -18,3 +18,10 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+# Lambda deployment artifacts
+lambda-function/deployment/
+lambda-function/*.zip
+
+# Lambda testing artifacts
+response.json
