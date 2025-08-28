@@ -12,6 +12,8 @@ requirements-dev.txt
 *.tfstate.*
 .terraform/
 .terraform.lock.hcl
+terraform.tfvars
+terraform/terraform.tfvars
 
 # AWS
 .aws/
