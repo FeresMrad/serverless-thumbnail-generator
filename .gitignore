@@ -25,7 +25,6 @@ terraform/terraform.tfvars
 # Lambda deployment artifacts
 lambda-function/deployment/
 lambda-function/*.zip
-lambda-function/test_local.py
 
 # Lambda testing artifacts
 response.json
