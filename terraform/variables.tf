@@ -1,3 +1,5 @@
+# Some values are provided in terraform.tfvars, with defaults defined here.
+
 variable "aws_region" {
   description = "AWS region"
   type        = string
